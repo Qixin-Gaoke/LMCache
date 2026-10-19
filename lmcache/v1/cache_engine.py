@@ -53,6 +53,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
     TensorMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.layerwise_lifetime import release_after_copy
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
@@ -1018,7 +1019,14 @@ class LMCacheEngine:
 
                 mem_objs_layer = task.result()
                 mem_obj_consumer.send(mem_objs_layer)
-                to_count_down.extend(mem_objs_layer)
+                if self.config.get_extra_config_value("layerwise_release_after_copy", False):
+                    # Retaining every layer until the end requires full-context
+                    # staging even for a layerwise connector, and deadlocks a
+                    # smaller bounded allocator. This opt-in conservative path
+                    # waits for DMA before permitting buffer reuse.
+                    release_after_copy(mem_objs_layer, self.gpu_connector.load_stream)
+                else:
+                    to_count_down.extend(mem_objs_layer)
 
             for mem_obj in to_count_down:
                 mem_obj.ref_count_down()
