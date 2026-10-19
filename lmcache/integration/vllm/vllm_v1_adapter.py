@@ -33,6 +33,7 @@ from lmcache.integration.vllm.utils import (
     extract_mm_features,
     lmcache_get_or_create_config,
 )
+from lmcache.integration.vllm.graph_load import finish_graph_loads
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
@@ -829,6 +830,7 @@ class LMCacheConnectorV1Impl:
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
+                        req_id=request.req_id,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
@@ -872,6 +874,10 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
+
+        # A full graph replay never calls the Python per-attention load hooks.
+        # Finish actual native layer transfers before handing control to replay.
+        finish_graph_loads(self, forward_context)
 
     def record_failed_blocks(
         self,
