@@ -74,6 +74,34 @@ INT_TO_LOCATION = {
 }
 
 
+def encode_wire_shape(shape: torch.Size, fmt: MemoryFormat) -> tuple[int, ...]:
+    """Encode a layerwise rank-three shape in the fixed four-slot wire header.
+
+    Existing rank-four headers are unchanged. A negative final sentinel marks
+    rank three, so empty/dummy rank-four headers remain unambiguous. Both peers
+    must support this extension before using a layerwise remote backend.
+    """
+    if len(shape) == 4 and all(dim >= 0 for dim in shape):
+        return tuple(shape)
+    if (len(shape) == 3 and fmt in (MemoryFormat.KV_T2D, MemoryFormat.KV_2TD)
+            and all(dim > 0 for dim in shape)):
+        return (*shape, -1)
+    raise ValueError("unsupported remote shape/format")
+
+
+def decode_wire_shape(shape: tuple[int, ...], fmt: MemoryFormat) -> torch.Size:
+    """Restore a validated shape from the fixed-width remote header."""
+    if len(shape) != 4:
+        raise ValueError("remote header must have four shape slots")
+    if shape[-1] == -1:
+        if fmt not in (MemoryFormat.KV_T2D, MemoryFormat.KV_2TD) or any(dim <= 0 for dim in shape[:3]):
+            raise ValueError("invalid layerwise remote shape")
+        return torch.Size(shape[:3])
+    if any(dim < 0 for dim in shape):
+        raise ValueError("invalid remote shape")
+    return torch.Size(shape)
+
+
 def init_remote_metadata_info(num_groups: int):
     global REMOTE_METADATA_FMT
     global REMOTE_METADATA_BYTES
@@ -106,7 +134,7 @@ class RemoteMetadata:
     def _prepare_params(self):
         params = [self.length, int(self.fmt.value)]
         for shape, dtype in zip(self.shapes, self.dtypes, strict=True):
-            assert len(shape) == 4, "Shape dimension should be 4"
+            shape = encode_wire_shape(shape, self.fmt)
             params.append(DTYPE_TO_INT[dtype])
             params.append(shape[0])
             params.append(shape[1])
@@ -135,7 +163,7 @@ class RemoteMetadata:
         shapes = []
         dtypes = []
         for i in range(2, len(result), 5):
-            shapes.append(torch.Size(result[i + 1 : i + 5]))
+            shapes.append(decode_wire_shape(tuple(result[i + 1 : i + 5]), memory_fmt))
             dtypes.append(INT_TO_DTYPE[result[i]])
 
         return RemoteMetadata(
@@ -171,7 +199,7 @@ class ClientMetaMessage:
 
         # NOTE(Jiayi): 4 is the maximum dimension of memory object.
         # Pass in shape [x, 0, 0, 0] if it is a bytes memory object
-        assert len(self.shape) == 4, "Shape dimension should be 4"
+        wire_shape = encode_wire_shape(self.shape, self.fmt)
 
         packed_bytes = struct.pack(
             f"iiiiiiiii{MAX_KEY_LENGTH}s",
@@ -180,10 +208,7 @@ class ClientMetaMessage:
             int(self.fmt.value),
             DTYPE_TO_INT[self.dtype],
             LOCATION_TO_INT[self.location],
-            self.shape[0],
-            self.shape[1],
-            self.shape[2],
-            self.shape[3],
+            *wire_shape,
             key_str.encode().ljust(MAX_KEY_LENGTH),
         )
         return packed_bytes
@@ -199,7 +224,7 @@ class ClientMetaMessage:
             length,
             MemoryFormat(fmt),
             INT_TO_DTYPE[dtype],
-            torch.Size([shape0, shape1, shape2, shape3]),
+            decode_wire_shape((shape0, shape1, shape2, shape3), MemoryFormat(fmt)),
             INT_TO_LOCATION[location],
         )
 
@@ -223,17 +248,14 @@ class ServerMetaMessage:
     location: Optional[str] = None
 
     def serialize(self) -> bytes:
-        assert len(self.shape) == 4, "Shape dimension should be 4"
+        wire_shape = encode_wire_shape(self.shape, self.fmt)
         packed_bytes = struct.pack(
             "iiiiiiiii",
             self.code.value,
             self.length,
             int(self.fmt.value),
             DTYPE_TO_INT[self.dtype],
-            self.shape[0],
-            self.shape[1],
-            self.shape[2],
-            self.shape[3],
+            *wire_shape,
             LOCATION_TO_INT[self.location],
         )
         return packed_bytes
@@ -252,6 +274,6 @@ class ServerMetaMessage:
             length,
             MemoryFormat(fmt),
             INT_TO_DTYPE[dtype],
-            torch.Size([shape0, shape1, shape2, shape3]),
+            decode_wire_shape((shape0, shape1, shape2, shape3), MemoryFormat(fmt)),
             INT_TO_LOCATION[location],
         )
