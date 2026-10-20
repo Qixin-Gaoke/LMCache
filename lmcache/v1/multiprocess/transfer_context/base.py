@@ -298,6 +298,8 @@ def gather_paged_kv_to_cpu(
 
     The KV tensor device selects the transfer backend and its buffer
     requirements, independently of process-wide accelerator availability.
+    NPU pointer transfers with supplied output buffers bound temporary staging
+    to four chunks and synchronize each batch before releasing its buffers.
 
     Args:
         kv_caches: Per-layer KV tensor mapping.
@@ -385,6 +387,29 @@ def gather_paged_kv_to_cpu(
             f"out length ({len(out)}) must be at least the number of "
             f"gathered chunks ({len(iter_indices)})"
         )
+
+    if (
+        device.type == "npu"
+        and not accepts_tensor
+        and out is not None
+        and len(iter_indices) > 4
+    ):
+        # The native NPU operator may stage host pointers through device memory.
+        # Enqueueing all chunks retains a second context-sized device allocation;
+        # stage and complete bounded batches before allocating the next batch.
+        for start in range(0, len(iter_indices), 4):
+            gather_paged_kv_to_cpu(
+                kv_caches,
+                block_ids,
+                blocks_per_chunk,
+                layout_hints=layout_hints,
+                engine_kv_format=engine_kv_format,
+                out=out[start : start + 4],
+                chunk_indices=iter_indices[start : start + 4],
+                engine_type=engine_type,
+            )
+            synchronize_device(device)
+        return out if len(out) == len(iter_indices) else out[: len(iter_indices)]
 
     # Determine if pinned memory is strictly required
     # (only for the compiled C++ path which does not accept tensor)
