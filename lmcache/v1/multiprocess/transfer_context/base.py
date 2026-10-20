@@ -669,7 +669,9 @@ def scatter_cpu_to_paged_kv(
                 continue
             scatter_cpu_to_paged_kv(
                 kv_caches,
-                block_ids[start * blocks_per_chunk : (start + len(batch)) * blocks_per_chunk],
+                block_ids[
+                    start * blocks_per_chunk : (start + len(batch)) * blocks_per_chunk
+                ],
                 batch,
                 blocks_per_chunk,
                 skip_first_n_tokens=skip_tokens,
