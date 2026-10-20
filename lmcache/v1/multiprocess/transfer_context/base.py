@@ -583,6 +583,7 @@ def scatter_cpu_to_paged_kv(
 
     The destination KV tensor device selects the transfer backend, not the
     CPU chunk device or process-wide accelerator availability.
+    NPU pointer transfers complete at most four chunks per staging batch.
 
     Args:
         kv_caches: Per-layer KV tensor mapping to write into.
@@ -657,6 +658,27 @@ def scatter_cpu_to_paged_kv(
             skip_first_n_tokens // block_size,
         )
     skip_prefix_n_blocks = skip_first_n_tokens // block_size
+
+    if device.type == "npu" and not accepts_tensor and len(chunks) > 4:
+        for start in range(0, len(chunks), 4):
+            batch = chunks[start : start + 4]
+            skip_tokens = max(
+                0, skip_prefix_n_blocks * block_size - start * chunk_tokens
+            )
+            if skip_tokens >= len(batch) * chunk_tokens:
+                continue
+            scatter_cpu_to_paged_kv(
+                kv_caches,
+                block_ids[start * blocks_per_chunk : (start + len(batch)) * blocks_per_chunk],
+                batch,
+                blocks_per_chunk,
+                skip_first_n_tokens=skip_tokens,
+                layout_hints=layout_hints,
+                engine_kv_format=engine_kv_format,
+                engine_type=engine_type,
+            )
+            synchronize_device(device)
+        return
 
     shape_desc = make_page_buffer_shape_desc(
         normalized,

@@ -73,3 +73,54 @@ def test_bounded_gather_preserves_outputs(
     assert completed == indices and not pending
     if extra == 0:
         assert result is outputs
+
+
+@pytest.mark.parametrize("skip", [0, 3, 10, 99])
+def test_bounded_scatter_preserves_global_skip(
+    monkeypatch: pytest.MonkeyPatch, skip: int
+) -> None:
+    """Preserve the global skipped prefix across bounded native batches.
+
+    Args:
+        monkeypatch: Replace device dispatch and individual native batches.
+        skip: Number of leading tokens whose destination must not change.
+    """
+    device = SimpleNamespace(type="npu")
+    monkeypatch.setattr(
+        utils, "normalize_kv_and_discover_format", lambda *a, **k: ("fmt", [])
+    )
+    monkeypatch.setattr(utils, "get_device", lambda tensors: device)
+    for name in ("get_block_size", "get_num_layers", "get_num_blocks"):
+        monkeypatch.setattr(utils, name, lambda *args: 1)
+    monkeypatch.setattr(
+        base,
+        "resolve_device_ops",
+        lambda kind: SimpleNamespace(multi_layer_block_kv_transfer=None),
+    )
+    monkeypatch.setattr(base, "_detect_block_transfer_accepts_tensor", lambda op: False)
+    destination = {}
+    pending = []
+
+    def scatter_batch(
+        kv: dict, blocks: list[int], chunks: list[list[int]], bpc: int,
+        **kwargs: Any,
+    ) -> None:
+        assert len(chunks) <= 4 and not pending
+        values = [value for chunk in chunks for value in chunk]
+        for index, (block, value) in enumerate(zip(blocks, values)):
+            if index >= kwargs["skip_first_n_tokens"]:
+                destination[block] = value
+        pending.extend(chunks)
+
+    def synchronize(selected: object) -> None:
+        assert selected is device and pending
+        pending.clear()
+
+    scatter = base.scatter_cpu_to_paged_kv
+    monkeypatch.setattr(base, "scatter_cpu_to_paged_kv", scatter_batch)
+    monkeypatch.setattr(base, "synchronize_device", synchronize)
+    blocks = list(reversed(range(18)))
+    chunks = [[2 * i, 2 * i + 1] for i in range(9)]
+    scatter({}, blocks + [100, 101], chunks, 2, skip_first_n_tokens=skip)
+    assert destination == {blocks[i]: i for i in range(min(skip, 18), 18)}
+    assert not pending
